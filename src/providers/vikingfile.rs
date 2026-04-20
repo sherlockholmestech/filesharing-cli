@@ -7,7 +7,10 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::progress;
+use crate::{http, progress, settings, token};
+
+const VIKING_GET_UPLOAD_URL_API: &str = "https://vikingfile.com/api/get-upload-url";
+const VIKING_COMPLETE_UPLOAD_API: &str = "https://vikingfile.com/api/complete-upload";
 
 pub struct VikingFile {
     client: Client,
@@ -43,8 +46,8 @@ struct PartInfo {
 impl VikingFile {
     pub fn new(token: Option<String>) -> Self {
         Self {
-            client: Client::new(),
-            token,
+            client: http::client().clone(),
+            token: token::normalize(token),
         }
     }
 
@@ -60,7 +63,7 @@ impl VikingFile {
         // Step 1 — get presigned part URLs.
         let resp = self
             .client
-            .post("https://vikingfile.com/api/get-upload-url")
+            .post(VIKING_GET_UPLOAD_URL_API)
             .form(&[("size", file_size.to_string())])
             .send()
             .await
@@ -68,16 +71,37 @@ impl VikingFile {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = http::read_error_body(resp).await;
             anyhow::bail!("get-upload-url failed (HTTP {}): {}", status, body.trim());
         }
 
-        let body_text = resp.text().await.context("Could not read get-upload-url response")?;
-        let init: UploadUrlResponse = serde_json::from_str(&body_text)
-            .with_context(|| format!("Could not parse get-upload-url response: {}", body_text.trim()))?;
+        let body_text = resp
+            .text()
+            .await
+            .context("Could not read get-upload-url response")?;
+        let init: UploadUrlResponse = serde_json::from_str(&body_text).with_context(|| {
+            format!(
+                "Could not parse get-upload-url response: {}",
+                body_text.trim()
+            )
+        })?;
+
+        if init.part_size == 0 {
+            anyhow::bail!("VikingFile returned invalid part size 0");
+        }
+        if init.number_parts == 0 || init.urls.is_empty() {
+            anyhow::bail!("VikingFile returned no presigned part URLs");
+        }
+        if init.urls.len() != init.number_parts as usize {
+            anyhow::bail!(
+                "VikingFile returned mismatched part metadata: {} urls for {} parts",
+                init.urls.len(),
+                init.number_parts
+            );
+        }
 
         // Step 2 — upload parts in parallel.
-        let parallelism = optimal_parallelism(file_size);
+        let parallelism = settings::upload_parallelism(file_size);
         let sem = Arc::new(Semaphore::new(parallelism));
         let bar = progress::new_bar(file_size, &file_name);
         let mut file = tokio::fs::File::open(file_path).await?;
@@ -106,11 +130,7 @@ impl VikingFile {
                     .with_context(|| format!("Part {} upload failed", part_number))?;
 
                 if !response.status().is_success() {
-                    anyhow::bail!(
-                        "Part {} failed (HTTP {})",
-                        part_number,
-                        response.status()
-                    );
+                    anyhow::bail!("Part {} failed (HTTP {})", part_number, response.status());
                 }
 
                 let etag = response
@@ -147,13 +167,16 @@ impl VikingFile {
         }
         for (i, part) in parts.iter().enumerate() {
             form = form
-                .text(format!("parts[{}][PartNumber]", i), part.part_number.to_string())
+                .text(
+                    format!("parts[{}][PartNumber]", i),
+                    part.part_number.to_string(),
+                )
                 .text(format!("parts[{}][ETag]", i), part.etag.clone());
         }
 
         let response = self
             .client
-            .post("https://vikingfile.com/api/complete-upload")
+            .post(VIKING_COMPLETE_UPLOAD_API)
             .multipart(form)
             .send()
             .await
@@ -161,7 +184,7 @@ impl VikingFile {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = http::read_error_body(response).await;
             anyhow::bail!("Complete upload failed (HTTP {}): {}", status, body.trim());
         }
 
@@ -171,16 +194,6 @@ impl VikingFile {
             .context("Could not parse complete-upload response")?;
 
         Ok(complete.url)
-    }
-}
-
-fn optimal_parallelism(file_size: u64) -> usize {
-    const GB: u64 = 1024 * 1024 * 1024;
-    match file_size {
-        s if s > 50 * GB => 3,
-        s if s > 10 * GB => 4,
-        s if s > GB => 5,
-        _ => 6,
     }
 }
 

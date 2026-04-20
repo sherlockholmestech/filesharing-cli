@@ -1,17 +1,29 @@
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http_body::Frame;
+use http_body::{Frame, SizeHint};
 use http_body_util::StreamBody;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use pin_project_lite::pin_project;
 use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 
-const DRAW_HZ: u8 = 20;
-/// Read buffer size — 64 KB gives a good balance between syscall overhead and
-/// progress-bar granularity even on fast connections.
-const READ_BUF: usize = 64 * 1024;
+fn draw_hz() -> u8 {
+    crate::settings::progress_draw_hz()
+}
+
+fn tick_duration() -> Duration {
+    Duration::from_millis(crate::settings::progress_tick_ms())
+}
+
+fn read_buffer_bytes() -> usize {
+    crate::settings::read_buffer_bytes()
+}
+
+// ── progress bars ─────────────────────────────────────────────────────────────
 
 fn bar_style() -> ProgressStyle {
     ProgressStyle::default_bar()
@@ -26,62 +38,105 @@ fn bar_style() -> ProgressStyle {
 fn configure(bar: &ProgressBar, file_name: &str) {
     bar.set_style(bar_style());
     bar.set_message(file_name.to_string());
-    // Keep ETA / speed updated even during brief pauses between chunks.
-    bar.enable_steady_tick(Duration::from_millis(100));
+    bar.enable_steady_tick(tick_duration());
 }
 
 pub fn new_bar(total_bytes: u64, file_name: &str) -> ProgressBar {
     let bar = ProgressBar::with_draw_target(
         Some(total_bytes),
-        ProgressDrawTarget::stderr_with_hz(DRAW_HZ),
+        ProgressDrawTarget::stderr_with_hz(draw_hz()),
     );
     configure(&bar, file_name);
     bar
 }
 
-/// Used when Content-Length is unknown (e.g. download without the header).
 pub fn new_bar_unknown(file_name: &str) -> ProgressBar {
-    let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(DRAW_HZ));
+    let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(draw_hz()));
     bar.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.cyan} {msg}\n{bytes}  {bytes_per_sec}")
             .expect("valid template"),
     );
     bar.set_message(file_name.to_string());
-    bar.enable_steady_tick(Duration::from_millis(100));
+    bar.enable_steady_tick(tick_duration());
     bar
 }
 
-/// Stream a whole file through a progress bar — used for single-PUT / multipart-form uploads.
+// ── SizedBody ─────────────────────────────────────────────────────────────────
+//
+// Wraps any Body and overrides size_hint() with an exact value so that hyper
+// sends Content-Length instead of Transfer-Encoding: chunked.  Without this,
+// StreamBody reports an unknown size and hyper falls back to chunked encoding
+// even when we manually set the Content-Length header.
+
+pin_project! {
+    pub struct SizedBody<B> {
+        #[pin]
+        inner: B,
+        size: u64,
+    }
+}
+
+impl<B> SizedBody<B> {
+    fn new(inner: B, size: u64) -> Self {
+        Self { inner, size }
+    }
+}
+
+impl<B> http_body::Body for SizedBody<B>
+where
+    B: http_body::Body,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.project().inner.poll_frame(cx)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.size)
+    }
+}
+
+// ── body builders ─────────────────────────────────────────────────────────────
+
+/// Stream a whole file through a progress bar.
+/// Returns a body with an exact size hint so hyper uses Content-Length.
 pub fn wrap_body(
     file: File,
+    file_size: u64,
     bar: ProgressBar,
-) -> StreamBody<impl futures_util::Stream<Item = Result<Frame<Bytes>, io::Error>> + Send + 'static>
-{
-    let stream = ReaderStream::with_capacity(file, READ_BUF).map(move |result| {
+) -> SizedBody<
+    StreamBody<impl futures_util::Stream<Item = Result<Frame<Bytes>, io::Error>> + Send + 'static>,
+> {
+    let stream = ReaderStream::with_capacity(file, read_buffer_bytes()).map(move |result| {
         result.map(|chunk| {
             bar.inc(chunk.len() as u64);
             Frame::data(chunk)
         })
     });
-    StreamBody::new(stream)
+    SizedBody::new(StreamBody::new(stream), file_size)
 }
 
-/// Stream an already-buffered `Vec<u8>` in 64 KB sub-chunks through a progress bar.
-/// Used for presigned-URL multipart parts where we must know the byte range upfront.
+/// Stream a pre-buffered Vec<u8> in 64 KB sub-chunks through a progress bar.
+/// Used for presigned-URL multipart parts.
 pub fn wrap_vec_body(
     data: Vec<u8>,
     bar: ProgressBar,
-) -> StreamBody<impl futures_util::Stream<Item = Result<Frame<Bytes>, io::Error>> + Send + 'static>
-{
-    let chunks: Vec<Bytes> = data
-        .chunks(READ_BUF)
-        .map(Bytes::copy_from_slice)
-        .collect();
+) -> SizedBody<
+    StreamBody<impl futures_util::Stream<Item = Result<Frame<Bytes>, io::Error>> + Send + 'static>,
+> {
+    let size = data.len() as u64;
+    let read_buf = read_buffer_bytes();
+    let chunks: Vec<Bytes> = data.chunks(read_buf).map(Bytes::copy_from_slice).collect();
 
     let stream = futures_util::stream::iter(chunks).map(move |bytes| {
         bar.inc(bytes.len() as u64);
         Ok(Frame::data(bytes))
     });
-    StreamBody::new(stream)
+    SizedBody::new(StreamBody::new(stream), size)
 }

@@ -84,8 +84,10 @@ Lists all supported providers with their size limits, expiry policies, and downl
 | pixeldrain | `pd` | unlimited | 60 days inactivity (resets on download) | same | yes |
 | vikingfile | `vf` | unlimited | 15 days after last download | never (premium) | no |
 | rootz | `rz` | 25 GB (anon) / unlimited (auth) | 15 days | no expiry | yes * |
+| 1fichier | `1f` | 300 GB/file · 500 GB/upload | no stated expiry | permanent | yes ** (Premium) |
 
 \* rootz download uses the file UUID; may not work for all share links.
+\** 1fichier download requires a Premium account API key.
 
 ### Token reference
 
@@ -96,6 +98,26 @@ Lists all supported providers with their size limits, expiry policies, and downl
 | pixeldrain | API key | [pixeldrain.com/user/api_keys](https://pixeldrain.com/user/api_keys) |
 | vikingfile | User hash | Dashboard on vikingfile.com |
 | rootz | API key | Dashboard settings on rootz.so |
+| 1fichier | API key | [1fichier.com/console/params.pl](https://1fichier.com/console/params.pl) |
+
+You can avoid passing tokens in shell history by using env vars:
+
+- `FSC_TOKEN` (fallback for all providers)
+- `FSC_GOFILE_TOKEN`, `FSC_FUCKINGFAST_TOKEN`, `FSC_PIXELDRAIN_TOKEN`, `FSC_VIKINGFILE_TOKEN`, `FSC_ROOTZ_TOKEN`, `FSC_1FICHIER_TOKEN`
+
+CLI `--token` still takes priority when provided.
+
+## Runtime tuning
+
+The CLI has configurable defaults via env vars:
+
+- `FSC_UPLOAD_PARALLELISM_MIN` / `FSC_UPLOAD_PARALLELISM_MAX`
+- `FSC_READ_BUFFER_BYTES`
+- `FSC_PROGRESS_HZ` / `FSC_PROGRESS_TICK_MS`
+- `FSC_HTTP_CONNECT_TIMEOUT_SECS` / `FSC_HTTP_REQUEST_TIMEOUT_SECS`
+- `FSC_HTTP_POOL_IDLE_TIMEOUT_SECS` / `FSC_HTTP_REDIRECT_LIMIT`
+
+If unset, sensible defaults are used.
 
 ## Upload behaviour
 

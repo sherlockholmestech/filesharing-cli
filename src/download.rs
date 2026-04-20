@@ -1,13 +1,20 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use reqwest::Client;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-use crate::progress;
+use crate::{http, progress, token};
+
+const MAX_URL_LEN: usize = 8 * 1024;
+const PIXELDRAIN_DOWNLOAD_API_BASE: &str = "https://pixeldrain.com/api/file";
+const GOFILE_CONTENTS_API_BASE: &str = "https://api.gofile.io/contents";
+const ROOTZ_DOWNLOAD_API_BASE: &str = "https://rootz.so/api/files/download";
+const FICHIER_DOWNLOAD_TOKEN_API: &str = "https://api.1fichier.com/v1/download/get_token.cgi";
 
 pub async fn download(url: &str, output: Option<&Path>, token: Option<&str>) -> Result<PathBuf> {
+    validate_download_url(url)?;
+
     let resolved = resolve_download_url(url, token).await?;
     fetch_to_file(&resolved.url, output, resolved.file_name.as_deref()).await
 }
@@ -20,10 +27,12 @@ struct Resolved {
 }
 
 async fn resolve_download_url(url: &str, token: Option<&str>) -> Result<Resolved> {
+    let url = url.trim();
+
     // pixeldrain.com/u/{id} or /l/{id}
     if let Some(id) = strip_segment(url, &["pixeldrain.com/u/", "pixeldrain.com/l/"]) {
         return Ok(Resolved {
-            url: format!("https://pixeldrain.com/api/file/{}?download", id),
+            url: format!("{}/{}?download", PIXELDRAIN_DOWNLOAD_API_BASE, id),
             file_name: None,
         });
     }
@@ -36,6 +45,11 @@ async fn resolve_download_url(url: &str, token: Option<&str>) -> Result<Resolved
     // rootz.so/d/{shortId}
     if let Some(id) = strip_segment(url, &["rootz.so/d/"]) {
         return resolve_rootz(id).await;
+    }
+
+    // 1fichier and its mirror domains
+    if is_1fichier_url(url) {
+        return resolve_1fichier(url, token).await;
     }
 
     // fuckingfast and vikingfile have no documented download API.
@@ -67,10 +81,24 @@ fn strip_segment<'a>(url: &'a str, prefixes: &[&str]) -> Option<&'a str> {
         .trim_start_matches("www.");
     for prefix in prefixes {
         if let Some(rest) = bare.strip_prefix(prefix) {
-            return Some(rest.split(['/', '?', '#']).next().unwrap_or(rest));
+            let segment = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+            if is_valid_share_id(segment) {
+                return Some(segment);
+            }
         }
     }
     None
+}
+
+fn is_valid_share_id(segment: &str) -> bool {
+    if segment.is_empty() || segment.len() > 256 {
+        return false;
+    }
+
+    segment
+        .as_bytes()
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_')
 }
 
 // ── Gofile ────────────────────────────────────────────────────────────────────
@@ -95,24 +123,35 @@ struct GofileChild {
 }
 
 async fn resolve_gofile(code: &str, token: Option<&str>) -> Result<Resolved> {
-    let client = Client::new();
-    let mut req = client.get(format!("https://api.gofile.io/contents/{}", code));
-    if let Some(t) = token {
+    let client = http::client();
+    let mut req = client.get(format!("{}/{}", GOFILE_CONTENTS_API_BASE, code));
+    if let Some(t) = token::normalize_ref(token) {
         req = req.header("Authorization", format!("Bearer {}", t));
     }
 
-    let resp: GofileContents = req
+    let response = req
         .send()
         .await
-        .context("Gofile API request failed")?
+        .with_context(|| format!("Gofile API request failed for folder {code}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = http::read_error_body(response).await;
+        anyhow::bail!(
+            "Gofile API request failed (HTTP {}) for folder {}: {}",
+            status,
+            code,
+            body.trim()
+        );
+    }
+
+    let resp: GofileContents = response
         .json()
         .await
         .context("Could not parse Gofile response")?;
 
     if resp.status != "ok" {
-        anyhow::bail!(
-            "Gofile returned non-ok status — folder may be private (try --token)"
-        );
+        anyhow::bail!("Gofile returned non-ok status — folder may be private (try --token)");
     }
 
     let children = resp
@@ -153,11 +192,24 @@ struct RootzDownloadData {
 }
 
 async fn resolve_rootz(id: &str) -> Result<Resolved> {
-    let resp: RootzDownload = Client::new()
-        .get(format!("https://rootz.so/api/files/download/{}", id))
+    let response = http::client()
+        .get(format!("{}/{}", ROOTZ_DOWNLOAD_API_BASE, id))
         .send()
         .await
-        .context("Rootz API request failed")?
+        .with_context(|| format!("Rootz API request failed for share ID {id}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = http::read_error_body(response).await;
+        anyhow::bail!(
+            "Rootz API request failed (HTTP {}) for share ID {}: {}",
+            status,
+            id,
+            body.trim()
+        );
+    }
+
+    let resp: RootzDownload = response
         .json()
         .await
         .context("Could not parse Rootz response")?;
@@ -178,6 +230,90 @@ async fn resolve_rootz(id: &str) -> Result<Resolved> {
     })
 }
 
+// ── 1fichier ──────────────────────────────────────────────────────────────────
+//
+// 1fichier hosts files on several domains.  All share the same /?<id> URL
+// shape.  Downloading via the API requires a Premium account API key; the
+// token returned is valid for ~5 minutes.
+
+const FICHIER_DOMAINS: &[&str] = &[
+    "1fichier.com/?",
+    "alterupload.com/?",
+    "cjoint.net/?",
+    "desfichiers.com/?",
+    "dfichiers.com/?",
+    "megadl.fr/?",
+    "mesfichiers.org/?",
+    "piecejointe.net/?",
+    "pjointe.com/?",
+    "tenvoi.com/?",
+    "dl4free.com/?",
+];
+
+fn is_1fichier_url(url: &str) -> bool {
+    let bare = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.");
+    FICHIER_DOMAINS.iter().any(|d| bare.starts_with(d))
+}
+
+#[derive(Deserialize)]
+struct FichierTokenResponse {
+    url: Option<String>,
+    status: String,
+    message: Option<String>,
+}
+
+async fn resolve_1fichier(url: &str, token: Option<&str>) -> Result<Resolved> {
+    let token = token::normalize_ref(token).ok_or_else(|| {
+        anyhow::anyhow!(
+            "1fichier download requires a Premium API key (--token YOUR_KEY).\n\
+             You can also set FSC_1FICHIER_TOKEN or FSC_TOKEN\n\
+             Obtain one at: https://1fichier.com/console/params.pl"
+        )
+    })?;
+
+    let response = http::client()
+        .post(FICHIER_DOWNLOAD_TOKEN_API)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "url": url }))
+        .send()
+        .await
+        .context("1fichier token request failed")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = http::read_error_body(response).await;
+        anyhow::bail!(
+            "1fichier token request failed (HTTP {}): {}",
+            status,
+            body.trim()
+        );
+    }
+
+    let resp: FichierTokenResponse = response
+        .json()
+        .await
+        .context("Could not parse 1fichier token response")?;
+
+    if resp.status != "OK" {
+        anyhow::bail!(
+            "1fichier download failed: {}",
+            resp.message.as_deref().unwrap_or("unknown error")
+        );
+    }
+
+    let download_url = resp
+        .url
+        .context("1fichier token response contained no download URL")?;
+
+    Ok(Resolved {
+        url: download_url,
+        file_name: None,
+    })
+}
+
 // ── HTTP fetch ────────────────────────────────────────────────────────────────
 
 async fn fetch_to_file(
@@ -185,25 +321,37 @@ async fn fetch_to_file(
     output: Option<&Path>,
     name_hint: Option<&str>,
 ) -> Result<PathBuf> {
-    let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()?;
-
-    let response = client.get(url).send().await.context("Request failed")?;
+    let response = http::client()
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Download request failed for URL: {url}"))?;
 
     let status = response.status();
     if !status.is_success() {
-        anyhow::bail!("Server returned HTTP {}", status);
+        let body = http::read_error_body(response).await;
+        anyhow::bail!("Download failed (HTTP {}): {}", status, body.trim());
     }
 
-    let file_name = output.map(|p| p.to_path_buf()).unwrap_or_else(|| {
-        let name = name_hint
-            .map(str::to_string)
-            .or_else(|| content_disposition_filename(response.headers()))
-            .or_else(|| url_filename(url))
-            .unwrap_or_else(|| "download".to_string());
-        PathBuf::from(name)
-    });
+    let file_name = match output {
+        Some(path) => {
+            if path.is_dir() {
+                anyhow::bail!("Output path points to a directory: {}", path.display());
+            }
+            path.to_path_buf()
+        }
+        None => {
+            let name = name_hint
+                .and_then(sanitize_file_name)
+                .or_else(|| {
+                    content_disposition_filename(response.headers())
+                        .and_then(|value| sanitize_file_name(&value))
+                })
+                .or_else(|| url_filename(url).and_then(|value| sanitize_file_name(&value)))
+                .unwrap_or_else(|| "download".to_string());
+            PathBuf::from(name)
+        }
+    };
 
     let total = response.content_length();
     let bar = match total {
@@ -213,16 +361,20 @@ async fn fetch_to_file(
 
     let mut dest = tokio::fs::File::create(&file_name)
         .await
-        .with_context(|| format!("Could not create: {}", file_name.display()))?;
+        .with_context(|| format!("Could not create output file: {}", file_name.display()))?;
 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Error reading response")?;
+        let chunk = chunk.with_context(|| format!("Error reading response body from {url}"))?;
         bar.inc(chunk.len() as u64);
-        dest.write_all(&chunk).await.context("Write error")?;
+        dest.write_all(&chunk)
+            .await
+            .with_context(|| format!("Failed writing to {}", file_name.display()))?;
     }
 
-    dest.flush().await?;
+    dest.flush()
+        .await
+        .with_context(|| format!("Failed flushing file {}", file_name.display()))?;
     bar.finish_and_clear();
 
     Ok(file_name)
@@ -248,5 +400,70 @@ fn url_filename(url: &str) -> Option<String> {
         None
     } else {
         Some(segment.to_string())
+    }
+}
+
+fn sanitize_file_name(raw: &str) -> Option<String> {
+    let normalized = raw.trim().replace('\\', "/");
+    let leaf = normalized.rsplit('/').next()?.trim();
+
+    if leaf.is_empty() || leaf == "." || leaf == ".." {
+        return None;
+    }
+
+    let cleaned: String = leaf
+        .chars()
+        .filter(|ch| !ch.is_control() && *ch != '/' && *ch != '\\')
+        .collect();
+
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn validate_download_url(url: &str) -> Result<()> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Download URL cannot be empty");
+    }
+    if trimmed.len() > MAX_URL_LEN {
+        anyhow::bail!("Download URL is too long (maximum {MAX_URL_LEN} bytes)");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_file_name, strip_segment, validate_download_url};
+
+    #[test]
+    fn strip_segment_rejects_invalid_share_id() {
+        assert_eq!(
+            strip_segment("https://gofile.io/d/abc_DEF-123", &["gofile.io/d/"]),
+            Some("abc_DEF-123")
+        );
+        assert_eq!(
+            strip_segment("https://gofile.io/d/../evil", &["gofile.io/d/"]),
+            None
+        );
+    }
+
+    #[test]
+    fn sanitize_file_name_keeps_leaf_only() {
+        assert_eq!(
+            sanitize_file_name("folder/sub/file.txt"),
+            Some("file.txt".to_string())
+        );
+        assert_eq!(sanitize_file_name(".."), None);
+        assert_eq!(sanitize_file_name(""), None);
+    }
+
+    #[test]
+    fn validates_download_url_length() {
+        assert!(validate_download_url("https://example.com/file").is_ok());
+        let long = format!("https://example.com/{}", "a".repeat(9_000));
+        assert!(validate_download_url(&long).is_err());
     }
 }

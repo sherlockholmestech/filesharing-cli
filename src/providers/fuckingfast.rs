@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use std::path::Path;
 
-use crate::progress;
+use crate::{http, progress, token};
+
+const FF_BASE_URL: &str = "https://w.fuckingfast.net";
 
 pub struct FuckingFast {
     client: Client,
@@ -13,8 +15,8 @@ pub struct FuckingFast {
 impl FuckingFast {
     pub fn new(token: Option<String>) -> Self {
         Self {
-            client: Client::new(),
-            token,
+            client: http::client().clone(),
+            token: token::normalize(token),
         }
     }
 
@@ -30,8 +32,8 @@ impl FuckingFast {
             .context("File has no valid name")?;
 
         let base = match parent_id {
-            Some(pid) => format!("https://w.fuckingfast.net/{}/{}", pid, file_name),
-            None => format!("https://w.fuckingfast.net/{}", file_name),
+            Some(pid) => format!("{}/{}/{}", FF_BASE_URL, pid, file_name),
+            None => format!("{}/{}", FF_BASE_URL, file_name),
         };
 
         let url = match note {
@@ -45,7 +47,7 @@ impl FuckingFast {
         let file_size = file.metadata().await?.len();
 
         let bar = progress::new_bar(file_size, file_name);
-        let body = reqwest::Body::wrap(progress::wrap_body(file, bar.clone()));
+        let body = reqwest::Body::wrap(progress::wrap_body(file, file_size, bar.clone()));
 
         let mut req = self
             .client
@@ -56,14 +58,24 @@ impl FuckingFast {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
 
-        let response = req.send().await.context("Request failed")?;
+        let response = req
+            .send()
+            .await
+            .context("FuckingFast upload request failed")?;
         bar.finish_and_clear();
 
         let status = response.status();
-        let body = response.text().await.context("Could not read response")?;
+        let body = response
+            .text()
+            .await
+            .context("Could not read FuckingFast response body")?;
 
         if !status.is_success() {
-            anyhow::bail!("Upload failed (HTTP {}): {}", status, body.trim());
+            anyhow::bail!(
+                "FuckingFast upload failed (HTTP {}): {}",
+                status,
+                body.trim()
+            );
         }
 
         extract_url(&body).with_context(|| format!("Unexpected response: {}", body.trim()))

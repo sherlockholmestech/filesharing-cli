@@ -3,7 +3,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::progress;
+use crate::{http, progress, token};
+
+const GOFILE_UPLOAD_URL: &str = "https://upload.gofile.io/uploadfile";
 
 pub struct Gofile {
     client: Client,
@@ -25,8 +27,8 @@ struct UploadData {
 impl Gofile {
     pub fn new(token: Option<String>) -> Self {
         Self {
-            client: Client::new(),
-            token,
+            client: http::client().clone(),
+            token: token::normalize(token),
         }
     }
 
@@ -43,38 +45,32 @@ impl Gofile {
         let file_size = file.metadata().await?.len();
 
         let bar = progress::new_bar(file_size, &file_name);
-        let body = reqwest::Body::wrap(progress::wrap_body(file, bar.clone()));
+        let body = reqwest::Body::wrap(progress::wrap_body(file, file_size, bar.clone()));
 
-        let file_part = reqwest::multipart::Part::stream_with_length(body, file_size)
-            .file_name(file_name);
+        let file_part =
+            reqwest::multipart::Part::stream_with_length(body, file_size).file_name(file_name);
 
         let mut form = reqwest::multipart::Form::new().part("file", file_part);
         if let Some(fid) = folder_id {
             form = form.text("folderId", fid.to_string());
         }
 
-        let mut req = self
-            .client
-            .post("https://upload.gofile.io/uploadfile")
-            .multipart(form);
+        let mut req = self.client.post(GOFILE_UPLOAD_URL).multipart(form);
 
         if let Some(token) = &self.token {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
 
-        let response = req.send().await.context("Request failed")?;
+        let response = req.send().await.context("Gofile upload request failed")?;
         bar.finish_and_clear();
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Upload failed (HTTP {}): {}", status, body.trim());
+            let body = http::read_error_body(response).await;
+            anyhow::bail!("Gofile upload failed (HTTP {}): {}", status, body.trim());
         }
 
-        let resp: UploadResponse = response
-            .json()
-            .await
-            .context("Could not parse response")?;
+        let resp: UploadResponse = response.json().await.context("Could not parse response")?;
 
         if resp.status != "ok" {
             anyhow::bail!("Gofile returned non-ok status: {}", resp.status);

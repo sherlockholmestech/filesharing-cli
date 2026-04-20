@@ -8,7 +8,13 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::progress;
+use crate::{http, progress, settings, token};
+
+const ROOTZ_SMALL_UPLOAD_API: &str = "https://rootz.so/api/files/upload";
+const ROOTZ_MULTIPART_INIT_API: &str = "https://rootz.so/api/files/multipart/init";
+const ROOTZ_MULTIPART_BATCH_URLS_API: &str = "https://rootz.so/api/files/multipart/batch-urls";
+const ROOTZ_MULTIPART_COMPLETE_API: &str = "https://rootz.so/api/files/multipart/complete";
+const ROOTZ_SHARE_BASE: &str = "https://rootz.so/d";
 
 const MULTIPART_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MB
 
@@ -87,8 +93,8 @@ struct CompleteFile {
 impl Rootz {
     pub fn new(token: Option<String>) -> Self {
         Self {
-            client: Client::new(),
-            token,
+            client: http::client().clone(),
+            token: token::normalize(token),
         }
     }
 
@@ -119,7 +125,7 @@ impl Rootz {
     ) -> Result<String> {
         let file = tokio::fs::File::open(file_path).await?;
         let bar = progress::new_bar(file_size, file_name);
-        let body = reqwest::Body::wrap(progress::wrap_body(file, bar.clone()));
+        let body = reqwest::Body::wrap(progress::wrap_body(file, file_size, bar.clone()));
 
         let file_part = reqwest::multipart::Part::stream_with_length(body, file_size)
             .file_name(file_name.to_string());
@@ -129,21 +135,18 @@ impl Rootz {
             form = form.text("folderId", fid.to_string());
         }
 
-        let mut req = self
-            .client
-            .post("https://rootz.so/api/files/upload")
-            .multipart(form);
+        let mut req = self.client.post(ROOTZ_SMALL_UPLOAD_API).multipart(form);
         if let Some(token) = &self.token {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
 
-        let response = req.send().await.context("Request failed")?;
+        let response = req.send().await.context("Rootz upload request failed")?;
         bar.finish_and_clear();
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Upload failed (HTTP {}): {}", status, body.trim());
+            let body = http::read_error_body(response).await;
+            anyhow::bail!("Rootz upload failed (HTTP {}): {}", status, body.trim());
         }
 
         let resp: SmallUploadResponse =
@@ -157,7 +160,7 @@ impl Rootz {
         }
 
         let short_id = resp.data.context("No data in response")?.short_id;
-        Ok(format!("https://rootz.so/d/{}", short_id))
+        Ok(format!("{}/{}", ROOTZ_SHARE_BASE, short_id))
     }
 
     async fn upload_multipart(
@@ -177,10 +180,7 @@ impl Rootz {
             init_body["folderId"] = serde_json::json!(fid);
         }
 
-        let mut init_req = self
-            .client
-            .post("https://rootz.so/api/files/multipart/init")
-            .json(&init_body);
+        let mut init_req = self.client.post(ROOTZ_MULTIPART_INIT_API).json(&init_body);
         if let Some(token) = &self.token {
             init_req = init_req.header("Authorization", format!("Bearer {}", token));
         }
@@ -193,10 +193,17 @@ impl Rootz {
             .await
             .context("Could not parse init response")?;
 
+        if init.chunk_size == 0 {
+            anyhow::bail!("Rootz returned invalid chunk size 0");
+        }
+        if init.total_parts == 0 {
+            anyhow::bail!("Rootz returned zero parts for multipart upload");
+        }
+
         // Step 2 — fetch all presigned URLs at once.
         let urls_resp: BatchUrlsResponse = self
             .client
-            .post("https://rootz.so/api/files/multipart/batch-urls")
+            .post(ROOTZ_MULTIPART_BATCH_URLS_API)
             .json(&serde_json::json!({
                 "key": init.key,
                 "uploadId": init.upload_id,
@@ -219,7 +226,7 @@ impl Rootz {
         // Chunks are read sequentially (single file handle), but the PUT
         // requests run concurrently, bounded by a semaphore.  Parallelism
         // follows the thresholds from the Rootz documentation.
-        let parallelism = optimal_parallelism(file_size);
+        let parallelism = settings::upload_parallelism(file_size);
         let sem = Arc::new(Semaphore::new(parallelism));
         let bar = progress::new_bar(file_size, file_name);
         let mut file = tokio::fs::File::open(file_path).await?;
@@ -253,11 +260,7 @@ impl Rootz {
                     .with_context(|| format!("Part {} upload failed", part_number))?;
 
                 if !response.status().is_success() {
-                    anyhow::bail!(
-                        "Part {} failed (HTTP {})",
-                        part_number,
-                        response.status()
-                    );
+                    anyhow::bail!("Part {} failed (HTTP {})", part_number, response.status());
                 }
 
                 let etag = response
@@ -294,7 +297,7 @@ impl Rootz {
 
         let mut complete_req = self
             .client
-            .post("https://rootz.so/api/files/multipart/complete")
+            .post(ROOTZ_MULTIPART_COMPLETE_API)
             .json(&complete_body);
         if let Some(token) = &self.token {
             complete_req = complete_req.header("Authorization", format!("Bearer {}", token));
@@ -315,19 +318,11 @@ impl Rootz {
             );
         }
 
-        let short_id = complete.file.context("No file in complete response")?.short_id;
-        Ok(format!("https://rootz.so/d/{}", short_id))
-    }
-}
-
-/// Parallelism thresholds from the Rootz documentation.
-fn optimal_parallelism(file_size: u64) -> usize {
-    const GB: u64 = 1024 * 1024 * 1024;
-    match file_size {
-        s if s > 50 * GB => 3,
-        s if s > 10 * GB => 4,
-        s if s > GB => 5,
-        _ => 6,
+        let short_id = complete
+            .file
+            .context("No file in complete response")?
+            .short_id;
+        Ok(format!("{}/{}", ROOTZ_SHARE_BASE, short_id))
     }
 }
 
