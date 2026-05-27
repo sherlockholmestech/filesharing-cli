@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use owo_colors::OwoColorize;
 use std::{env, path::PathBuf};
 
 mod download;
@@ -7,11 +8,12 @@ mod http;
 mod progress;
 mod providers;
 mod settings;
+mod style;
 mod token;
 
 use providers::{
-    fichier::OneFichier, fuckingfast::FuckingFast, gofile::Gofile, pixeldrain::Pixeldrain,
-    rootz::Rootz, vikingfile::VikingFile,
+    catbox::Catbox, fichier::OneFichier, fuckingfast::FuckingFast, gofile::Gofile,
+    litterbox::Litterbox, pixeldrain::Pixeldrain, rootz::Rootz, vikingfile::VikingFile,
 };
 
 #[derive(Parser)]
@@ -29,7 +31,7 @@ struct Cli {
 enum Commands {
     /// Download a file from a URL or provider share link
     Download {
-        /// URL or share link to download (supports 1fichier, gofile, pixeldrain, rootz; others: use direct URL)
+        /// URL or share link to download (supports catbox, gofile, litterbox, pixeldrain, rootz, 1fichier; others: use direct URL)
         url: String,
 
         /// Output file path (default: derived from URL or Content-Disposition header)
@@ -46,13 +48,14 @@ enum Commands {
         /// Path to the file to upload
         file: PathBuf,
 
-        /// Provider: gofile (gf), fuckingfast (ff), pixeldrain (pd), vikingfile (vf), rootz (rz), 1fichier (1f)
+        /// Provider: gofile (gf), fuckingfast (ff), pixeldrain (pd), vikingfile (vf), rootz (rz), 1fichier (1f), catbox (cb), litterbox (lb)
         #[arg(short, long, default_value = "gofile")]
         provider: String,
 
         /// API token — gofile: API token · fuckingfast: account ID ·
         /// pixeldrain: API key · vikingfile: user hash · rootz: API key ·
-        /// 1fichier: API key (prefer FSC_TOKEN or provider-specific FSC_*_TOKEN env vars)
+        /// 1fichier: API key · catbox: userhash (optional) · litterbox: not needed
+        /// (prefer FSC_TOKEN or provider-specific FSC_*_TOKEN env vars)
         #[arg(short, long)]
         token: Option<String>,
 
@@ -71,16 +74,30 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
 
+    if let Err(err) = run(cli).await {
+        eprintln!("{}", style::error(err.to_string()));
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Commands::Providers => print_providers(),
+        Commands::Providers => {
+            print_providers();
+        }
 
         Commands::Download { url, output, token } => {
             let token = resolve_download_token(&url, token);
             let path = download::download(&url, output.as_deref(), token.as_deref()).await?;
-            println!("Saved to {}", path.display());
+            println!(
+                "{} {} {}",
+                style::ok_prefix(),
+                "Saved".bold(),
+                style::dim(format!("{}", path.display()))
+            );
         }
 
         Commands::Upload {
@@ -97,10 +114,11 @@ async fn main() -> Result<()> {
                 anyhow::bail!("Not a regular file: {}", file.display());
             }
 
-            let provider_name = canonical_provider(&provider);
+            let provider_name = canonical_provider(&provider)?;
             let token = resolve_upload_token(provider_name, token);
 
             let url = match provider_name {
+                "catbox" => Catbox::new(token.clone()).upload(&file).await?,
                 "fuckingfast" => {
                     FuckingFast::new(token.clone())
                         .upload(&file, note.as_deref(), folder.as_deref())
@@ -108,6 +126,11 @@ async fn main() -> Result<()> {
                 }
                 "gofile" => {
                     Gofile::new(token.clone())
+                        .upload(&file, folder.as_deref())
+                        .await?
+                }
+                "litterbox" => {
+                    Litterbox::new(token.clone())
                         .upload(&file, folder.as_deref())
                         .await?
                 }
@@ -127,13 +150,15 @@ async fn main() -> Result<()> {
                         .upload(&file, folder.as_deref())
                         .await?
                 }
-                _ => anyhow::bail!(
-                    "Unknown provider '{}'. Run 'fsc providers' to see all options.",
-                    provider
-                ),
+                _ => unreachable!("canonical_provider returned unknown name"),
             };
 
-            println!("{}", url);
+            println!(
+                "{} {} {}",
+                style::ok_prefix(),
+                "Uploaded to".bold(),
+                style::url(&url)
+            );
         }
     }
 
@@ -141,15 +166,28 @@ async fn main() -> Result<()> {
 }
 
 fn print_providers() {
-    // columns: name · alias · size limit · anon expiry · auth expiry
-    // columns: name · alias · size limit · anon expiry · auth expiry · download
+    use comfy_table::{ContentArrangement, Table, modifiers::UTF8_ROUND_CORNERS};
+
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header([
+            "Provider",
+            "Alias",
+            "Size limit",
+            "Anon expiry",
+            "Auth expiry",
+            "Download",
+        ]);
+
     let rows: &[(&str, &str, &str, &str, &str, &str)] = &[
         (
-            "gofile",
-            "gf",
-            "unlimited",
-            "10 days (resets on download)",
-            "permanent (premium)",
+            "catbox",
+            "cb",
+            "200 MB",
+            "permanent",
+            "permanent (with account)",
             "yes",
         ),
         (
@@ -159,6 +197,22 @@ fn print_providers() {
             "deleted if <30 downloads in 60 days",
             "same",
             "no",
+        ),
+        (
+            "gofile",
+            "gf",
+            "unlimited",
+            "10 days (resets on download)",
+            "permanent (premium)",
+            "yes",
+        ),
+        (
+            "litterbox",
+            "lb",
+            "unlimited",
+            "1h / 12h / 24h / 72h",
+            "same",
+            "yes",
         ),
         (
             "pixeldrain",
@@ -194,85 +248,54 @@ fn print_providers() {
         ),
     ];
 
-    let headers = [
-        "PROVIDER",
-        "ALIAS",
-        "SIZE LIMIT",
-        "ANON EXPIRY",
-        "AUTH EXPIRY",
-        "DOWNLOAD",
-    ];
-    let mut widths = [0usize; 6];
-    for (i, h) in headers.iter().enumerate() {
-        widths[i] = h.len();
-    }
     for (name, alias, size, anon, auth, dl) in rows {
-        let cols = [*name, *alias, *size, *anon, *auth, *dl];
-        for (i, col) in cols.iter().enumerate() {
-            widths[i] = widths[i].max(col.len());
-        }
+        table.add_row([*name, *alias, *size, *anon, *auth, *dl]);
     }
 
-    let [w0, w1, w2, w3, w4, _] = widths;
+    println!("{table}");
     println!(
-        "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {}",
-        headers[0],
-        headers[1],
-        headers[2],
-        headers[3],
-        headers[4],
-        headers[5],
-        w0 = w0,
-        w1 = w1,
-        w2 = w2,
-        w3 = w3,
-        w4 = w4
+        "{}",
+        style::dim("* rootz download uses the file UUID; may not work for all share links")
     );
-    println!("{}", "-".repeat(widths.iter().sum::<usize>() + 5 * 2));
-    for (name, alias, size, anon, auth, dl) in rows {
-        println!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {}",
-            name,
-            alias,
-            size,
-            anon,
-            auth,
-            dl,
-            w0 = w0,
-            w1 = w1,
-            w2 = w2,
-            w3 = w3,
-            w4 = w4
-        );
-    }
-    println!("\n* rootz download uses the file UUID; may not work for all share links");
-    println!("** 1fichier download requires a Premium account API key");
+    println!(
+        "{}",
+        style::dim("** 1fichier download requires a Premium account API key")
+    );
 }
 
 /// Resolve short aliases to canonical provider names.
-fn canonical_provider(name: &str) -> &str {
-    match name.trim().to_ascii_lowercase().as_str() {
+fn canonical_provider(name: &str) -> Result<&str> {
+    Ok(match name.trim().to_ascii_lowercase().as_str() {
+        "cb" => "catbox",
         "ff" => "fuckingfast",
         "gf" => "gofile",
+        "lb" => "litterbox",
         "pd" => "pixeldrain",
         "vf" => "vikingfile",
         "rz" => "rootz",
         "1f" => "1fichier",
+        "catbox" => "catbox",
         "fuckingfast" => "fuckingfast",
         "gofile" => "gofile",
+        "litterbox" => "litterbox",
         "pixeldrain" => "pixeldrain",
         "vikingfile" => "vikingfile",
         "rootz" => "rootz",
         "1fichier" => "1fichier",
-        _ => name,
-    }
+        _ => anyhow::bail!(
+            "Unknown provider '{}'. Run 'fsc providers' to see all options.",
+            name
+        ),
+    })
 }
 
 fn resolve_upload_token(provider: &str, cli_token: Option<String>) -> Option<String> {
     token::normalize(cli_token).or_else(|| {
         let keys: &[&str] = match provider {
-            "gofile" => &["FSC_GOFILE_TOKEN", "FSC_TOKEN"],
+            "catbox" => &["FSC_CATBOX_TOKEN", "FSC_TOKEN"],
             "fuckingfast" => &["FSC_FUCKINGFAST_TOKEN", "FSC_TOKEN"],
+            "gofile" => &["FSC_GOFILE_TOKEN", "FSC_TOKEN"],
+            "litterbox" => &["FSC_LITTERBOX_TOKEN", "FSC_TOKEN"],
             "pixeldrain" => &["FSC_PIXELDRAIN_TOKEN", "FSC_TOKEN"],
             "vikingfile" => &["FSC_VIKINGFILE_TOKEN", "FSC_TOKEN"],
             "rootz" => &["FSC_ROOTZ_TOKEN", "FSC_TOKEN"],
@@ -286,7 +309,9 @@ fn resolve_upload_token(provider: &str, cli_token: Option<String>) -> Option<Str
 fn resolve_download_token(url: &str, cli_token: Option<String>) -> Option<String> {
     token::normalize(cli_token).or_else(|| {
         let keys: &[&str] = match infer_download_provider(url) {
+            Some("catbox") => &["FSC_CATBOX_TOKEN", "FSC_TOKEN"],
             Some("gofile") => &["FSC_GOFILE_TOKEN", "FSC_TOKEN"],
+            Some("litterbox") => &["FSC_LITTERBOX_TOKEN", "FSC_TOKEN"],
             Some("pixeldrain") => &["FSC_PIXELDRAIN_TOKEN", "FSC_TOKEN"],
             Some("rootz") => &["FSC_ROOTZ_TOKEN", "FSC_TOKEN"],
             Some("1fichier") => &["FSC_1FICHIER_TOKEN", "FSC_TOKEN"],
@@ -307,8 +332,14 @@ fn first_env_token(keys: &[&str]) -> Option<String> {
 fn infer_download_provider(url: &str) -> Option<&'static str> {
     let lower = url.to_ascii_lowercase();
 
+    if lower.contains("catbox.moe") {
+        return Some("catbox");
+    }
     if lower.contains("gofile.io") {
         return Some("gofile");
+    }
+    if lower.contains("litterbox.catbox.moe") {
+        return Some("litterbox");
     }
     if lower.contains("pixeldrain.com") {
         return Some("pixeldrain");
@@ -316,18 +347,7 @@ fn infer_download_provider(url: &str) -> Option<&'static str> {
     if lower.contains("rootz.so") {
         return Some("rootz");
     }
-    if lower.contains("1fichier.com")
-        || lower.contains("alterupload.com")
-        || lower.contains("cjoint.net")
-        || lower.contains("desfichiers.com")
-        || lower.contains("dfichiers.com")
-        || lower.contains("megadl.fr")
-        || lower.contains("mesfichiers.org")
-        || lower.contains("piecejointe.net")
-        || lower.contains("pjointe.com")
-        || lower.contains("tenvoi.com")
-        || lower.contains("dl4free.com")
-    {
+    if download::is_1fichier_url(&lower) {
         return Some("1fichier");
     }
 

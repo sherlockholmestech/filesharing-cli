@@ -3,10 +3,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use super::util::read_chunk;
 use crate::{http, progress, settings, token};
 
 const VIKING_GET_UPLOAD_URL_API: &str = "https://vikingfile.com/api/get-upload-url";
@@ -195,17 +195,4 @@ impl VikingFile {
 
         Ok(complete.url)
     }
-}
-
-async fn read_chunk(file: &mut tokio::fs::File, capacity: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; capacity];
-    let mut total = 0;
-    while total < capacity {
-        match file.read(&mut buf[total..]).await? {
-            0 => break,
-            n => total += n,
-        }
-    }
-    buf.truncate(total);
-    Ok(buf)
 }

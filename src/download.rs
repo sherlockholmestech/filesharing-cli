@@ -52,6 +52,15 @@ async fn resolve_download_url(url: &str, token: Option<&str>) -> Result<Resolved
         return resolve_1fichier(url, token).await;
     }
 
+    // catbox.moe and litterbox.catbox.moe — direct file URLs
+    if url.contains("catbox.moe") || url.contains("litterbox.catbox.moe") {
+        // These are direct file URLs, download as-is
+        return Ok(Resolved {
+            url: url.to_string(),
+            file_name: None,
+        });
+    }
+
     // fuckingfast and vikingfile have no documented download API.
     if url.contains("fuckingfast.net") {
         anyhow::bail!(
@@ -73,12 +82,13 @@ async fn resolve_download_url(url: &str, token: Option<&str>) -> Result<Resolved
     })
 }
 
-/// Extract the first path segment after any of the given prefixes (scheme-agnostic).
+/// Extract the first path segment after any of the given prefixes.
+/// Matches against the URL host (after `://` and optional `www.`) to avoid
+/// false positives where the prefix appears later in the path.
 fn strip_segment<'a>(url: &'a str, prefixes: &[&str]) -> Option<&'a str> {
-    let bare = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches("www.");
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let bare = after_scheme.strip_prefix("www.").unwrap_or(after_scheme);
+
     for prefix in prefixes {
         if let Some(rest) = bare.strip_prefix(prefix) {
             let segment = rest.split(['/', '?', '#']).next().unwrap_or(rest);
@@ -236,7 +246,7 @@ async fn resolve_rootz(id: &str) -> Result<Resolved> {
 // shape.  Downloading via the API requires a Premium account API key; the
 // token returned is valid for ~5 minutes.
 
-const FICHIER_DOMAINS: &[&str] = &[
+pub const FICHIER_DOMAINS: &[&str] = &[
     "1fichier.com/?",
     "alterupload.com/?",
     "cjoint.net/?",
@@ -250,11 +260,9 @@ const FICHIER_DOMAINS: &[&str] = &[
     "dl4free.com/?",
 ];
 
-fn is_1fichier_url(url: &str) -> bool {
-    let bare = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches("www.");
+pub fn is_1fichier_url(url: &str) -> bool {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let bare = after_scheme.strip_prefix("www.").unwrap_or(after_scheme);
     FICHIER_DOMAINS.iter().any(|d| bare.starts_with(d))
 }
 
@@ -446,6 +454,18 @@ mod tests {
         );
         assert_eq!(
             strip_segment("https://gofile.io/d/../evil", &["gofile.io/d/"]),
+            None
+        );
+    }
+
+    #[test]
+    fn strip_segment_rejects_prefix_in_path() {
+        assert_eq!(
+            strip_segment("http://evil.com/gofile.io/d/abc", &["gofile.io/d/"]),
+            None
+        );
+        assert_eq!(
+            strip_segment("https://evil.com/www.gofile.io/d/abc", &["gofile.io/d/"]),
             None
         );
     }

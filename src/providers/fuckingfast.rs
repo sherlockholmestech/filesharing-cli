@@ -65,18 +65,19 @@ impl FuckingFast {
         bar.finish_and_clear();
 
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("Could not read FuckingFast response body")?;
-
         if !status.is_success() {
+            let body = http::read_error_body(response).await;
             anyhow::bail!(
                 "FuckingFast upload failed (HTTP {}): {}",
                 status,
                 body.trim()
             );
         }
+
+        let body = response
+            .text()
+            .await
+            .context("Could not read FuckingFast response body")?;
 
         extract_url(&body).with_context(|| format!("Unexpected response: {}", body.trim()))
     }

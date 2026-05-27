@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use super::util::read_chunk;
 use crate::{http, progress, settings, token};
 
 const ROOTZ_SMALL_UPLOAD_API: &str = "https://rootz.so/api/files/upload";
@@ -324,18 +324,4 @@ impl Rootz {
             .short_id;
         Ok(format!("{}/{}", ROOTZ_SHARE_BASE, short_id))
     }
-}
-
-/// Reads up to `capacity` bytes from `file`, returning however many were available.
-async fn read_chunk(file: &mut tokio::fs::File, capacity: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; capacity];
-    let mut total = 0;
-    while total < capacity {
-        match file.read(&mut buf[total..]).await? {
-            0 => break,
-            n => total += n,
-        }
-    }
-    buf.truncate(total);
-    Ok(buf)
 }

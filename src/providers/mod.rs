@@ -1,6 +1,9 @@
+pub mod catbox;
 pub mod fichier;
 pub mod fuckingfast;
 pub mod gofile;
+pub mod litterbox;
 pub mod pixeldrain;
 pub mod rootz;
+pub mod util;
 pub mod vikingfile;
