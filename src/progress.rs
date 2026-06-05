@@ -132,11 +132,14 @@ pub fn wrap_vec_body(
 > {
     let size = data.len() as u64;
     let read_buf = read_buffer_bytes();
-    let chunks: Vec<Bytes> = data.chunks(read_buf).map(Bytes::copy_from_slice).collect();
+    let bytes = Bytes::from(data);
+    let len = bytes.len();
 
-    let stream = futures_util::stream::iter(chunks).map(move |bytes| {
-        bar.inc(bytes.len() as u64);
-        Ok(Frame::data(bytes))
+    let stream = futures_util::stream::iter((0..len).step_by(read_buf)).map(move |start| {
+        let end = (start + read_buf).min(len);
+        let chunk = bytes.slice(start..end);
+        bar.inc(chunk.len() as u64);
+        Ok(Frame::data(chunk))
     });
     SizedBody::new(StreamBody::new(stream), size)
 }

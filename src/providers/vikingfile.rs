@@ -61,13 +61,16 @@ impl VikingFile {
         let file_size = tokio::fs::metadata(file_path).await?.len();
 
         // Step 1 — get presigned part URLs.
-        let resp = self
-            .client
-            .post(VIKING_GET_UPLOAD_URL_API)
-            .form(&[("size", file_size.to_string())])
-            .send()
-            .await
-            .context("get-upload-url request failed")?;
+        let resp = http::send_retrying(
+            || {
+                self.client
+                    .post(VIKING_GET_UPLOAD_URL_API)
+                    .form(&[("size", file_size.to_string())])
+            },
+            "get-upload-url request",
+        )
+        .await
+        .context("get-upload-url request failed")?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -146,41 +149,37 @@ impl VikingFile {
         }
 
         let mut parts: Vec<PartInfo> = Vec::with_capacity(init.number_parts as usize);
-        while let Some(res) = tasks.join_next().await {
-            parts.push(res.context("Upload task panicked")??);
+        let upload_result = async {
+            while let Some(res) = tasks.join_next().await {
+                parts.push(res.context("Upload task panicked")??);
+            }
+            Ok::<(), anyhow::Error>(())
         }
-        parts.sort_unstable_by_key(|p| p.part_number);
-
+        .await;
         bar.finish_and_clear();
+        upload_result?;
+        parts.sort_unstable_by_key(|p| p.part_number);
 
         // Step 3 — complete.
         // The API uses PHP-style indexed form encoding: parts[0][PartNumber]=1&parts[0][ETag]=...
         let user = self.token.clone().unwrap_or_default();
-        let mut form = reqwest::multipart::Form::new()
-            .text("key", init.key)
-            .text("uploadId", init.upload_id)
-            .text("name", file_name)
-            .text("user", user);
-
-        if let Some(path) = folder {
-            form = form.text("path", path.to_string());
-        }
-        for (i, part) in parts.iter().enumerate() {
-            form = form
-                .text(
-                    format!("parts[{}][PartNumber]", i),
-                    part.part_number.to_string(),
-                )
-                .text(format!("parts[{}][ETag]", i), part.etag.clone());
-        }
-
-        let response = self
-            .client
-            .post(VIKING_COMPLETE_UPLOAD_API)
-            .multipart(form)
-            .send()
-            .await
-            .context("complete-upload request failed")?;
+        let response = http::send_retrying(
+            || {
+                self.client
+                    .post(VIKING_COMPLETE_UPLOAD_API)
+                    .multipart(clone_complete_form(
+                        &init.key,
+                        &init.upload_id,
+                        &file_name,
+                        &user,
+                        folder,
+                        &parts,
+                    ))
+            },
+            "complete-upload request",
+        )
+        .await
+        .context("complete-upload request failed")?;
 
         let status = response.status();
         if !status.is_success() {
@@ -195,4 +194,33 @@ impl VikingFile {
 
         Ok(complete.url)
     }
+}
+
+fn clone_complete_form(
+    key: &str,
+    upload_id: &str,
+    file_name: &str,
+    user: &str,
+    folder: Option<&str>,
+    parts: &[PartInfo],
+) -> reqwest::multipart::Form {
+    let mut form = reqwest::multipart::Form::new()
+        .text("key", key.to_string())
+        .text("uploadId", upload_id.to_string())
+        .text("name", file_name.to_string())
+        .text("user", user.to_string());
+
+    if let Some(path) = folder {
+        form = form.text("path", path.to_string());
+    }
+    for (i, part) in parts.iter().enumerate() {
+        form = form
+            .text(
+                format!("parts[{}][PartNumber]", i),
+                part.part_number.to_string(),
+            )
+            .text(format!("parts[{}][ETag]", i), part.etag.clone());
+    }
+
+    form
 }

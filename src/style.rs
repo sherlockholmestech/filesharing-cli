@@ -21,6 +21,10 @@ pub fn error(msg: impl AsRef<str>) -> String {
     format!("{}{}", err_prefix(), msg.as_ref().red())
 }
 
+pub fn warn(msg: impl AsRef<str>) -> String {
+    if_color(msg.as_ref().yellow().to_string(), msg.as_ref().to_string())
+}
+
 pub fn url(msg: impl AsRef<str>) -> String {
     if_color(
         msg.as_ref().blue().underline().to_string(),

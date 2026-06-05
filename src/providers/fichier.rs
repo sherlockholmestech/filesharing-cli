@@ -51,13 +51,16 @@ impl OneFichier {
         // POST (per the official cURL example) to get_upload_server.cgi returns
         // the hostname of the node that will accept the file and a unique upload
         // ID used to track progress and retrieve the report.
-        let server_resp = self
-            .client
-            .post(FICHIER_UPLOAD_SERVER_API)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .context("Could not reach 1fichier server selector")?;
+        let server_resp = http::send_retrying(
+            || {
+                self.client
+                    .post(FICHIER_UPLOAD_SERVER_API)
+                    .json(&serde_json::json!({}))
+            },
+            "1fichier server selector",
+        )
+        .await
+        .context("Could not reach 1fichier server selector")?;
 
         let server_status = server_resp.status();
         if !server_status.is_success() {
@@ -113,8 +116,9 @@ impl OneFichier {
             upload_req = upload_req.header("Authorization", format!("Bearer {}", token));
         }
 
-        let upload_resp = upload_req.send().await.context("Upload request failed")?;
+        let upload_resp = upload_req.send().await.context("Upload request failed");
         bar.finish_and_clear();
+        let upload_resp = upload_resp?;
 
         let upload_status = upload_resp.status();
 
@@ -140,13 +144,12 @@ impl OneFichier {
         // The request must go to the same upload node.  Adding the "JSON: 1"
         // request header switches the response from HTML to JSON.
         let end_url = format!("https://{}/end.pl?xid={}", upload_host, xid);
-        let end_resp = self
-            .client
-            .get(&end_url)
-            .header("JSON", "1")
-            .send()
-            .await
-            .context("Failed to fetch upload report (end.pl)")?;
+        let end_resp = http::send_retrying(
+            || self.client.get(&end_url).header("JSON", "1"),
+            "1fichier upload report request",
+        )
+        .await
+        .context("Failed to fetch upload report (end.pl)")?;
 
         let end_status = end_resp.status();
         if !end_status.is_success() {

@@ -6,9 +6,11 @@ const DEFAULT_PROGRESS_TICK_MS: u64 = 100;
 const DEFAULT_READ_BUFFER_BYTES: usize = 64 * KB;
 
 const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 15;
-const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_HTTP_READ_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_HTTP_REDIRECT_LIMIT: usize = 10;
+const DEFAULT_HTTP_RETRY_ATTEMPTS: usize = 4;
+const DEFAULT_HTTP_RETRY_BACKOFF_MS: u64 = 500;
 
 pub fn progress_draw_hz() -> u8 {
     parse_env_u8("FSC_PROGRESS_HZ", DEFAULT_PROGRESS_DRAW_HZ, 1, 60)
@@ -36,10 +38,11 @@ pub fn http_connect_timeout_secs() -> u64 {
     )
 }
 
-pub fn http_request_timeout_secs() -> u64 {
-    parse_env_u64(
+pub fn http_read_timeout_secs() -> u64 {
+    parse_env_u64_with_fallback(
+        "FSC_HTTP_READ_TIMEOUT_SECS",
         "FSC_HTTP_REQUEST_TIMEOUT_SECS",
-        DEFAULT_HTTP_REQUEST_TIMEOUT_SECS,
+        DEFAULT_HTTP_READ_TIMEOUT_SECS,
         5,
         3_600,
     )
@@ -60,6 +63,24 @@ pub fn http_redirect_limit() -> usize {
         DEFAULT_HTTP_REDIRECT_LIMIT,
         0,
         50,
+    )
+}
+
+pub fn http_retry_attempts() -> usize {
+    parse_env_usize(
+        "FSC_HTTP_RETRY_ATTEMPTS",
+        DEFAULT_HTTP_RETRY_ATTEMPTS,
+        0,
+        10,
+    )
+}
+
+pub fn http_retry_backoff_ms() -> u64 {
+    parse_env_u64(
+        "FSC_HTTP_RETRY_BACKOFF_MS",
+        DEFAULT_HTTP_RETRY_BACKOFF_MS,
+        50,
+        30_000,
     )
 }
 
@@ -98,6 +119,21 @@ fn parse_env_u8(key: &str, default: u8, min: u8, max: u8) -> u8 {
 
 fn parse_env_u64(key: &str, default: u64, min: u64, max: u64) -> u64 {
     std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn parse_env_u64_with_fallback(
+    key: &str,
+    fallback_key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> u64 {
+    std::env::var(key)
+        .or_else(|_| std::env::var(fallback_key))
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(|value| value.clamp(min, max))

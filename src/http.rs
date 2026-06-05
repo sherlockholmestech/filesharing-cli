@@ -1,6 +1,8 @@
-use reqwest::{Client, redirect::Policy};
+use anyhow::{Context, Result};
+use reqwest::{Client, RequestBuilder, Response, StatusCode, header, redirect::Policy};
 use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::time::sleep;
 
 static CLIENT: OnceLock<Client> = OnceLock::new();
 
@@ -23,13 +25,38 @@ pub async fn read_error_body(response: reqwest::Response) -> String {
     }
 }
 
+pub async fn send_retrying<F>(mut build_request: F, operation: &str) -> Result<Response>
+where
+    F: FnMut() -> RequestBuilder,
+{
+    let max_retries = crate::settings::http_retry_attempts();
+    let mut attempt = 0;
+
+    loop {
+        match build_request().send().await {
+            Ok(response) if should_retry_status(response.status()) && attempt < max_retries => {
+                let delay = retry_delay(attempt, response.headers().get(header::RETRY_AFTER));
+                attempt += 1;
+                sleep(delay).await;
+            }
+            Ok(response) => return Ok(response),
+            Err(err) if should_retry_error(&err) && attempt < max_retries => {
+                let delay = retry_delay(attempt, None);
+                attempt += 1;
+                sleep(delay).await;
+            }
+            Err(err) => return Err(err).with_context(|| format!("{operation} failed")),
+        }
+    }
+}
+
 fn build_client(redirect_policy: Policy) -> reqwest::Result<Client> {
     Client::builder()
         .connect_timeout(Duration::from_secs(
             crate::settings::http_connect_timeout_secs(),
         ))
-        .timeout(Duration::from_secs(
-            crate::settings::http_request_timeout_secs(),
+        .read_timeout(Duration::from_secs(
+            crate::settings::http_read_timeout_secs(),
         ))
         .pool_idle_timeout(Duration::from_secs(
             crate::settings::http_pool_idle_timeout_secs(),
@@ -37,4 +64,33 @@ fn build_client(redirect_policy: Policy) -> reqwest::Result<Client> {
         .redirect(redirect_policy)
         .user_agent(concat!("fsc/", env!("CARGO_PKG_VERSION")))
         .build()
+}
+
+fn should_retry_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn should_retry_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout() || err.is_body()
+}
+
+fn retry_delay(attempt: usize, retry_after: Option<&header::HeaderValue>) -> Duration {
+    if let Some(seconds) = retry_after
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_secs(seconds.clamp(1, 300));
+    }
+
+    let base_ms = crate::settings::http_retry_backoff_ms();
+    let multiplier = 1u64 << attempt.min(6);
+    Duration::from_millis(base_ms.saturating_mul(multiplier).min(30_000))
 }

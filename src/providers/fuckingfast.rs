@@ -61,8 +61,9 @@ impl FuckingFast {
         let response = req
             .send()
             .await
-            .context("FuckingFast upload request failed")?;
+            .context("FuckingFast upload request failed");
         bar.finish_and_clear();
+        let response = response?;
 
         let status = response.status();
         if !status.is_success() {

@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use reqwest::{
+    Response,
+    header::{CONTENT_RANGE, RANGE},
+};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -133,16 +137,18 @@ struct GofileChild {
 }
 
 async fn resolve_gofile(code: &str, token: Option<&str>) -> Result<Resolved> {
-    let client = http::client();
-    let mut req = client.get(format!("{}/{}", GOFILE_CONTENTS_API_BASE, code));
-    if let Some(t) = token::normalize_ref(token) {
-        req = req.header("Authorization", format!("Bearer {}", t));
-    }
-
-    let response = req
-        .send()
-        .await
-        .with_context(|| format!("Gofile API request failed for folder {code}"))?;
+    let response = http::send_retrying(
+        || {
+            let mut req = http::client().get(format!("{}/{}", GOFILE_CONTENTS_API_BASE, code));
+            if let Some(t) = token::normalize_ref(token) {
+                req = req.header("Authorization", format!("Bearer {}", t));
+            }
+            req
+        },
+        "Gofile API request",
+    )
+    .await
+    .with_context(|| format!("Gofile API request failed for folder {code}"))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -202,11 +208,12 @@ struct RootzDownloadData {
 }
 
 async fn resolve_rootz(id: &str) -> Result<Resolved> {
-    let response = http::client()
-        .get(format!("{}/{}", ROOTZ_DOWNLOAD_API_BASE, id))
-        .send()
-        .await
-        .with_context(|| format!("Rootz API request failed for share ID {id}"))?;
+    let response = http::send_retrying(
+        || http::client().get(format!("{}/{}", ROOTZ_DOWNLOAD_API_BASE, id)),
+        "Rootz API request",
+    )
+    .await
+    .with_context(|| format!("Rootz API request failed for share ID {id}"))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -282,13 +289,17 @@ async fn resolve_1fichier(url: &str, token: Option<&str>) -> Result<Resolved> {
         )
     })?;
 
-    let response = http::client()
-        .post(FICHIER_DOWNLOAD_TOKEN_API)
-        .header("Authorization", format!("Bearer {}", token))
-        .json(&serde_json::json!({ "url": url }))
-        .send()
-        .await
-        .context("1fichier token request failed")?;
+    let response = http::send_retrying(
+        || {
+            http::client()
+                .post(FICHIER_DOWNLOAD_TOKEN_API)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&serde_json::json!({ "url": url }))
+        },
+        "1fichier token request",
+    )
+    .await
+    .context("1fichier token request failed")?;
 
     let status = response.status();
     if !status.is_success() {
@@ -329,9 +340,7 @@ async fn fetch_to_file(
     output: Option<&Path>,
     name_hint: Option<&str>,
 ) -> Result<PathBuf> {
-    let response = http::client()
-        .get(url)
-        .send()
+    let response = http::send_retrying(|| http::client().get(url), "Download request")
         .await
         .with_context(|| format!("Download request failed for URL: {url}"))?;
 
@@ -361,15 +370,139 @@ async fn fetch_to_file(
         }
     };
 
-    let total = response.content_length();
-    let bar = match total {
-        Some(n) => progress::new_bar(n, &file_name.to_string_lossy()),
-        None => progress::new_bar_unknown(&file_name.to_string_lossy()),
+    let part_file_name = partial_path(&file_name);
+    let mut response = Some(response);
+
+    for attempt in 0..=crate::settings::http_retry_attempts() {
+        let existing_len = partial_len(&part_file_name).await?;
+        let (next_response, resume_from) = if existing_len == 0 {
+            (response.take(), 0)
+        } else {
+            (None, existing_len)
+        };
+
+        let response = match next_response {
+            Some(response) => response,
+            None => request_download_range(url, resume_from).await?,
+        };
+
+        match write_download_response(url, response, &file_name, &part_file_name, resume_from).await
+        {
+            Ok(()) => {
+                tokio::fs::rename(&part_file_name, &file_name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed moving {} to {}",
+                            part_file_name.display(),
+                            file_name.display()
+                        )
+                    })?;
+                return Ok(file_name);
+            }
+            Err(err) if attempt < crate::settings::http_retry_attempts() => {
+                eprintln!(
+                    "{}",
+                    crate::style::warn(format!(
+                        "Download interrupted, retrying from byte {}: {}",
+                        partial_len(&part_file_name).await.unwrap_or(0),
+                        err
+                    ))
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("download retry loop always returns")
+}
+
+async fn request_download_range(url: &str, start: u64) -> Result<Response> {
+    let response = http::send_retrying(
+        || {
+            let mut req = http::client().get(url);
+            if start > 0 {
+                req = req.header(RANGE, format!("bytes={start}-"));
+            }
+            req
+        },
+        "Download request",
+    )
+    .await
+    .with_context(|| format!("Download request failed for URL: {url}"))?;
+
+    let status = response.status();
+    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && start > 0 {
+        return http::send_retrying(|| http::client().get(url), "Download restart request")
+            .await
+            .with_context(|| format!("Download restart request failed for URL: {url}"));
+    }
+    if !status.is_success() {
+        let body = http::read_error_body(response).await;
+        anyhow::bail!("Download failed (HTTP {}): {}", status, body.trim());
+    }
+
+    Ok(response)
+}
+
+async fn write_download_response(
+    url: &str,
+    response: Response,
+    file_name: &Path,
+    part_file_name: &Path,
+    requested_resume_from: u64,
+) -> Result<()> {
+    let status = response.status();
+    let resume_from = if requested_resume_from > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT
+    {
+        requested_resume_from
+    } else {
+        0
     };
 
-    let mut dest = tokio::fs::File::create(&file_name)
+    let total = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        content_range_total(response.headers()).or_else(|| {
+            response
+                .content_length()
+                .map(|remaining| remaining + requested_resume_from)
+        })
+    } else {
+        response.content_length()
+    };
+
+    let bar = match total {
+        Some(n) => {
+            let bar = progress::new_bar(n, &file_name.to_string_lossy());
+            bar.set_position(resume_from);
+            bar
+        }
+        None => {
+            let bar = progress::new_bar_unknown(&file_name.to_string_lossy());
+            bar.inc(resume_from);
+            bar
+        }
+    };
+
+    let result = stream_to_part(url, response, part_file_name, resume_from > 0, &bar).await;
+    bar.finish_and_clear();
+    result
+}
+
+async fn stream_to_part(
+    url: &str,
+    response: Response,
+    part_file_name: &Path,
+    append: bool,
+    bar: &indicatif::ProgressBar,
+) -> Result<()> {
+    let mut dest = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(part_file_name)
         .await
-        .with_context(|| format!("Could not create output file: {}", file_name.display()))?;
+        .with_context(|| format!("Could not create output file: {}", part_file_name.display()))?;
 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -377,15 +510,40 @@ async fn fetch_to_file(
         bar.inc(chunk.len() as u64);
         dest.write_all(&chunk)
             .await
-            .with_context(|| format!("Failed writing to {}", file_name.display()))?;
+            .with_context(|| format!("Failed writing to {}", part_file_name.display()))?;
     }
 
     dest.flush()
         .await
-        .with_context(|| format!("Failed flushing file {}", file_name.display()))?;
-    bar.finish_and_clear();
+        .with_context(|| format!("Failed flushing file {}", part_file_name.display()))
+}
 
-    Ok(file_name)
+async fn partial_len(path: &Path) -> Result<u64> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) => Ok(meta.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err).with_context(|| format!("Could not inspect {}", path.display())),
+    }
+}
+
+fn partial_path(path: &Path) -> PathBuf {
+    let mut part = path.to_path_buf();
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download");
+    part.set_file_name(format!("{name}.part"));
+    part
+}
+
+fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(CONTENT_RANGE)?.to_str().ok()?;
+    let total = value.rsplit_once('/')?.1;
+    if total == "*" {
+        None
+    } else {
+        total.parse().ok()
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -444,7 +602,11 @@ fn validate_download_url(url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_file_name, strip_segment, validate_download_url};
+    use super::{
+        content_range_total, partial_path, sanitize_file_name, strip_segment, validate_download_url,
+    };
+    use reqwest::header::{CONTENT_RANGE, HeaderMap};
+    use std::path::Path;
 
     #[test]
     fn strip_segment_rejects_invalid_share_id() {
@@ -485,5 +647,23 @@ mod tests {
         assert!(validate_download_url("https://example.com/file").is_ok());
         let long = format!("https://example.com/{}", "a".repeat(9_000));
         assert!(validate_download_url(&long).is_err());
+    }
+
+    #[test]
+    fn parses_content_range_total() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, "bytes 100-199/1000".parse().unwrap());
+        assert_eq!(content_range_total(&headers), Some(1000));
+
+        headers.insert(CONTENT_RANGE, "bytes 100-199/*".parse().unwrap());
+        assert_eq!(content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn partial_path_appends_part_suffix() {
+        assert_eq!(
+            partial_path(Path::new("/tmp/archive.tar.gz")),
+            Path::new("/tmp/archive.tar.gz.part")
+        );
     }
 }

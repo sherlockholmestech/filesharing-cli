@@ -61,8 +61,9 @@ impl Gofile {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
 
-        let response = req.send().await.context("Gofile upload request failed")?;
+        let response = req.send().await.context("Gofile upload request failed");
         bar.finish_and_clear();
+        let response = response?;
 
         let status = response.status();
         if !status.is_success() {

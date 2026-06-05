@@ -59,11 +59,9 @@ impl Litterbox {
             req = req.header("Authorization", format!("Bearer {}", userhash));
         }
 
-        let response = req
-            .send()
-            .await
-            .context("Litterbox upload request failed")?;
+        let response = req.send().await.context("Litterbox upload request failed");
         bar.finish_and_clear();
+        let response = response?;
 
         let status = response.status();
         if !status.is_success() {

@@ -140,8 +140,9 @@ impl Rootz {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
 
-        let response = req.send().await.context("Rootz upload request failed")?;
+        let response = req.send().await.context("Rootz upload request failed");
         bar.finish_and_clear();
+        let response = response?;
 
         let status = response.status();
         if !status.is_success() {
@@ -180,18 +181,21 @@ impl Rootz {
             init_body["folderId"] = serde_json::json!(fid);
         }
 
-        let mut init_req = self.client.post(ROOTZ_MULTIPART_INIT_API).json(&init_body);
-        if let Some(token) = &self.token {
-            init_req = init_req.header("Authorization", format!("Bearer {}", token));
-        }
-
-        let init: InitResponse = init_req
-            .send()
-            .await
-            .context("Multipart init request failed")?
-            .json()
-            .await
-            .context("Could not parse init response")?;
+        let init: InitResponse = http::send_retrying(
+            || {
+                let mut req = self.client.post(ROOTZ_MULTIPART_INIT_API).json(&init_body);
+                if let Some(token) = &self.token {
+                    req = req.header("Authorization", format!("Bearer {}", token));
+                }
+                req
+            },
+            "Multipart init request",
+        )
+        .await
+        .context("Multipart init request failed")?
+        .json()
+        .await
+        .context("Could not parse init response")?;
 
         if init.chunk_size == 0 {
             anyhow::bail!("Rootz returned invalid chunk size 0");
@@ -201,20 +205,23 @@ impl Rootz {
         }
 
         // Step 2 — fetch all presigned URLs at once.
-        let urls_resp: BatchUrlsResponse = self
-            .client
-            .post(ROOTZ_MULTIPART_BATCH_URLS_API)
-            .json(&serde_json::json!({
-                "key": init.key,
-                "uploadId": init.upload_id,
-                "totalParts": init.total_parts,
-            }))
-            .send()
-            .await
-            .context("Batch URL request failed")?
-            .json()
-            .await
-            .context("Could not parse batch URLs response")?;
+        let urls_resp: BatchUrlsResponse = http::send_retrying(
+            || {
+                self.client
+                    .post(ROOTZ_MULTIPART_BATCH_URLS_API)
+                    .json(&serde_json::json!({
+                        "key": &init.key,
+                        "uploadId": &init.upload_id,
+                        "totalParts": init.total_parts,
+                    }))
+            },
+            "Batch URL request",
+        )
+        .await
+        .context("Batch URL request failed")?
+        .json()
+        .await
+        .context("Could not parse batch URLs response")?;
 
         if !urls_resp.success {
             anyhow::bail!("Failed to obtain presigned upload URLs");
@@ -277,12 +284,16 @@ impl Rootz {
 
         // Collect results — any task error surfaces here.
         let mut parts: Vec<PartInfo> = Vec::with_capacity(init.total_parts as usize);
-        while let Some(res) = tasks.join_next().await {
-            parts.push(res.context("Upload task panicked")??);
+        let upload_result = async {
+            while let Some(res) = tasks.join_next().await {
+                parts.push(res.context("Upload task panicked")??);
+            }
+            Ok::<(), anyhow::Error>(())
         }
-        parts.sort_unstable_by_key(|p| p.part_number);
-
+        .await;
         bar.finish_and_clear();
+        upload_result?;
+        parts.sort_unstable_by_key(|p| p.part_number);
 
         // Step 4 — finalise.
         let complete_body = CompleteRequest {
@@ -295,21 +306,24 @@ impl Rootz {
             folder_id,
         };
 
-        let mut complete_req = self
-            .client
-            .post(ROOTZ_MULTIPART_COMPLETE_API)
-            .json(&complete_body);
-        if let Some(token) = &self.token {
-            complete_req = complete_req.header("Authorization", format!("Bearer {}", token));
-        }
-
-        let complete: CompleteResponse = complete_req
-            .send()
-            .await
-            .context("Multipart complete request failed")?
-            .json()
-            .await
-            .context("Could not parse complete response")?;
+        let complete: CompleteResponse = http::send_retrying(
+            || {
+                let mut req = self
+                    .client
+                    .post(ROOTZ_MULTIPART_COMPLETE_API)
+                    .json(&complete_body);
+                if let Some(token) = &self.token {
+                    req = req.header("Authorization", format!("Bearer {}", token));
+                }
+                req
+            },
+            "Multipart complete request",
+        )
+        .await
+        .context("Multipart complete request failed")?
+        .json()
+        .await
+        .context("Could not parse complete response")?;
 
         if !complete.success {
             anyhow::bail!(

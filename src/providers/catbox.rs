@@ -47,8 +47,9 @@ impl Catbox {
 
         let req = self.client.post(CATBOX_UPLOAD_URL).multipart(form);
 
-        let response = req.send().await.context("Catbox upload request failed")?;
+        let response = req.send().await.context("Catbox upload request failed");
         bar.finish_and_clear();
+        let response = response?;
 
         let status = response.status();
         if !status.is_success() {

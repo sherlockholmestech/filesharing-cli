@@ -52,11 +52,9 @@ impl Pixeldrain {
             req = req.basic_auth("", Some(token));
         }
 
-        let response = req
-            .send()
-            .await
-            .context("Pixeldrain upload request failed")?;
+        let response = req.send().await.context("Pixeldrain upload request failed");
         bar.finish_and_clear();
+        let response = response?;
 
         let status = response.status();
         if !status.is_success() {
