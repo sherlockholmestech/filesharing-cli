@@ -121,25 +121,3 @@ pub fn wrap_body(
     });
     SizedBody::new(StreamBody::new(stream), file_size)
 }
-
-/// Stream a pre-buffered Vec<u8> in 64 KB sub-chunks through a progress bar.
-/// Used for presigned-URL multipart parts.
-pub fn wrap_vec_body(
-    data: Vec<u8>,
-    bar: ProgressBar,
-) -> SizedBody<
-    StreamBody<impl futures_util::Stream<Item = Result<Frame<Bytes>, io::Error>> + Send + 'static>,
-> {
-    let size = data.len() as u64;
-    let read_buf = read_buffer_bytes();
-    let bytes = Bytes::from(data);
-    let len = bytes.len();
-
-    let stream = futures_util::stream::iter((0..len).step_by(read_buf)).map(move |start| {
-        let end = (start + read_buf).min(len);
-        let chunk = bytes.slice(start..end);
-        bar.inc(chunk.len() as u64);
-        Ok(Frame::data(chunk))
-    });
-    SizedBody::new(StreamBody::new(stream), size)
-}

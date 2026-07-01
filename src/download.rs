@@ -340,24 +340,21 @@ async fn fetch_to_file(
     output: Option<&Path>,
     name_hint: Option<&str>,
 ) -> Result<PathBuf> {
-    let response = http::send_retrying(|| http::client().get(url), "Download request")
-        .await
-        .with_context(|| format!("Download request failed for URL: {url}"))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = http::read_error_body(response).await;
-        anyhow::bail!("Download failed (HTTP {}): {}", status, body.trim());
-    }
+    let mut initial_response = None;
 
     let file_name = match output {
         Some(path) => {
             if path.is_dir() {
                 anyhow::bail!("Output path points to a directory: {}", path.display());
             }
-            path.to_path_buf()
+            let file_name = path.to_path_buf();
+            if partial_len(&partial_path(&file_name)).await? == 0 {
+                initial_response = Some(request_download_range(url, 0).await?);
+            }
+            file_name
         }
         None => {
+            let response = request_download_range(url, 0).await?;
             let name = name_hint
                 .and_then(sanitize_file_name)
                 .or_else(|| {
@@ -366,22 +363,17 @@ async fn fetch_to_file(
                 })
                 .or_else(|| url_filename(url).and_then(|value| sanitize_file_name(&value)))
                 .unwrap_or_else(|| "download".to_string());
+            initial_response = Some(response);
             PathBuf::from(name)
         }
     };
 
     let part_file_name = partial_path(&file_name);
-    let mut response = Some(response);
 
     for attempt in 0..=crate::settings::http_retry_attempts() {
         let existing_len = partial_len(&part_file_name).await?;
-        let (next_response, resume_from) = if existing_len == 0 {
-            (response.take(), 0)
-        } else {
-            (None, existing_len)
-        };
-
-        let response = match next_response {
+        let resume_from = existing_len;
+        let response = match initial_response.take().filter(|_| resume_from == 0) {
             Some(response) => response,
             None => request_download_range(url, resume_from).await?,
         };
@@ -433,9 +425,15 @@ async fn request_download_range(url: &str, start: u64) -> Result<Response> {
 
     let status = response.status();
     if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && start > 0 {
-        return http::send_retrying(|| http::client().get(url), "Download restart request")
+        let response = http::send_retrying(|| http::client().get(url), "Download restart request")
             .await
-            .with_context(|| format!("Download restart request failed for URL: {url}"));
+            .with_context(|| format!("Download restart request failed for URL: {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = http::read_error_body(response).await;
+            anyhow::bail!("Download failed (HTTP {}): {}", status, body.trim());
+        }
+        return Ok(response);
     }
     if !status.is_success() {
         let body = http::read_error_body(response).await;
@@ -453,9 +451,34 @@ async fn write_download_response(
     requested_resume_from: u64,
 ) -> Result<()> {
     let status = response.status();
-    let resume_from = if requested_resume_from > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT
-    {
-        requested_resume_from
+    let resume_from = if requested_resume_from > 0 {
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let actual_start = content_range_start(response.headers());
+            if actual_start != Some(requested_resume_from) {
+                tokio::fs::remove_file(part_file_name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Could not discard invalid partial file {}",
+                            part_file_name.display()
+                        )
+                    })?;
+                anyhow::bail!(
+                    "Download server returned unexpected Content-Range start {:?}; expected {}",
+                    actual_start,
+                    requested_resume_from
+                );
+            }
+            requested_resume_from
+        } else {
+            eprintln!(
+                "{}",
+                crate::style::warn(
+                    "Download server ignored resume request; restarting from byte 0"
+                )
+            );
+            0
+        }
     } else {
         0
     };
@@ -546,6 +569,13 @@ fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     }
 }
 
+fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(CONTENT_RANGE)?.to_str().ok()?;
+    let range = value.strip_prefix("bytes ")?;
+    let (start, _) = range.split_once('-')?;
+    start.parse().ok()
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn content_disposition_filename(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -603,7 +633,8 @@ fn validate_download_url(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_range_total, partial_path, sanitize_file_name, strip_segment, validate_download_url,
+        content_range_start, content_range_total, partial_path, sanitize_file_name, strip_segment,
+        validate_download_url,
     };
     use reqwest::header::{CONTENT_RANGE, HeaderMap};
     use std::path::Path;
@@ -657,6 +688,13 @@ mod tests {
 
         headers.insert(CONTENT_RANGE, "bytes 100-199/*".parse().unwrap());
         assert_eq!(content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn parses_content_range_start() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, "bytes 100-199/1000".parse().unwrap());
+        assert_eq!(content_range_start(&headers), Some(100));
     }
 
     #[test]

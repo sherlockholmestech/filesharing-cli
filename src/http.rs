@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, header, redirect::Policy};
+use std::fmt;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -36,12 +37,26 @@ where
         match build_request().send().await {
             Ok(response) if should_retry_status(response.status()) && attempt < max_retries => {
                 let delay = retry_delay(attempt, response.headers().get(header::RETRY_AFTER));
+                warn_retry(
+                    operation,
+                    attempt,
+                    max_retries,
+                    delay,
+                    format_args!("HTTP {}", response.status()),
+                );
                 attempt += 1;
                 sleep(delay).await;
             }
             Ok(response) => return Ok(response),
             Err(err) if should_retry_error(&err) && attempt < max_retries => {
                 let delay = retry_delay(attempt, None);
+                warn_retry(
+                    operation,
+                    attempt,
+                    max_retries,
+                    delay,
+                    format_args!("{}", retry_error_reason(&err)),
+                );
                 attempt += 1;
                 sleep(delay).await;
             }
@@ -80,6 +95,38 @@ fn should_retry_status(status: StatusCode) -> bool {
 
 fn should_retry_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || err.is_body()
+}
+
+fn retry_error_reason(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connection failed"
+    } else if err.is_body() {
+        "body stream interrupted"
+    } else {
+        "transient network error"
+    }
+}
+
+fn warn_retry(
+    operation: &str,
+    attempt: usize,
+    max_retries: usize,
+    delay: Duration,
+    reason: fmt::Arguments<'_>,
+) {
+    eprintln!(
+        "{}",
+        crate::style::warn(format!(
+            "{} failed ({}), retrying {}/{} in {:.1}s",
+            operation,
+            reason,
+            attempt + 1,
+            max_retries,
+            delay.as_secs_f64()
+        ))
+    );
 }
 
 fn retry_delay(attempt: usize, retry_after: Option<&header::HeaderValue>) -> Duration {

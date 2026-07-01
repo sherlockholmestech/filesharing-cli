@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use super::util::read_chunk;
+use super::util::{read_chunk, upload_presigned_part};
 use crate::{http, progress, settings, token};
 
 const ROOTZ_SMALL_UPLOAD_API: &str = "https://rootz.so/api/files/upload";
@@ -246,7 +246,6 @@ impl Rootz {
                 .clone();
 
             let chunk = read_chunk(&mut file, init.chunk_size as usize).await?;
-            let chunk_len = chunk.len() as u64;
 
             // Acquire before spawning so we never have more than `parallelism`
             // concurrent uploads in flight.
@@ -256,27 +255,7 @@ impl Rootz {
 
             tasks.spawn(async move {
                 let _permit = permit; // released when this task finishes
-                let body = reqwest::Body::wrap(progress::wrap_vec_body(chunk, bar));
-
-                let response = client
-                    .put(&url)
-                    .header("Content-Length", chunk_len)
-                    .body(body)
-                    .send()
-                    .await
-                    .with_context(|| format!("Part {} upload failed", part_number))?;
-
-                if !response.status().is_success() {
-                    anyhow::bail!("Part {} failed (HTTP {})", part_number, response.status());
-                }
-
-                let etag = response
-                    .headers()
-                    .get("ETag")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .trim_matches('"')
-                    .to_string();
+                let etag = upload_presigned_part(&client, &url, part_number, chunk, &bar).await?;
 
                 Ok(PartInfo { part_number, etag })
             });
