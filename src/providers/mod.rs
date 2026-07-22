@@ -5,5 +5,8 @@ pub mod gofile;
 pub mod litterbox;
 pub mod pixeldrain;
 pub mod rootz;
+pub mod temp_sh;
+pub mod tmpfiles;
+pub mod uguu;
 pub mod util;
 pub mod vikingfile;

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use dialoguer::Select;
+use dialoguer::FuzzySelect;
 use owo_colors::OwoColorize;
 use std::{env, path::PathBuf};
 
@@ -8,13 +8,15 @@ mod download;
 mod http;
 mod progress;
 mod providers;
+mod qr;
 mod settings;
 mod style;
 mod token;
 
 use providers::{
     catbox::Catbox, fichier::OneFichier, fuckingfast::FuckingFast, gofile::Gofile,
-    litterbox::Litterbox, pixeldrain::Pixeldrain, rootz::Rootz, vikingfile::VikingFile,
+    litterbox::Litterbox, pixeldrain::Pixeldrain, rootz::Rootz, temp_sh::TempSh,
+    tmpfiles::TmpFiles, uguu::Uguu, vikingfile::VikingFile,
 };
 
 const DEFAULT_PROVIDER: &str = "gofile";
@@ -27,6 +29,9 @@ const PROVIDER_NAMES: &[&str] = &[
     "vikingfile",
     "rootz",
     "1fichier",
+    "uguu",
+    "tmpfiles",
+    "temp.sh",
 ];
 
 #[derive(Parser)]
@@ -61,7 +66,7 @@ enum Commands {
         /// Path to the file to upload
         file: PathBuf,
 
-        /// Provider: gofile (gf), fuckingfast (ff), pixeldrain (pd), vikingfile (vf), rootz (rz), 1fichier (1f), catbox (cb), litterbox (lb)
+        /// Provider name or alias (run `fsc providers` for the full list)
         #[arg(short, long)]
         provider: Option<String>,
 
@@ -84,6 +89,10 @@ enum Commands {
         /// fuckingfast: parent dir ID (requires --token) · 1fichier: folder ID
         #[arg(short, long)]
         folder: Option<String>,
+
+        /// Print a QR code and save qr_[filename].png beside the uploaded file
+        #[arg(long)]
+        qr: bool,
     },
 
     /// Show upload limits and expiry for all providers
@@ -124,6 +133,7 @@ async fn run(cli: Cli) -> Result<()> {
             token,
             note,
             folder,
+            qr,
         } => {
             if !file.exists() {
                 anyhow::bail!("File not found: {}", file.display());
@@ -154,6 +164,9 @@ async fn run(cli: Cli) -> Result<()> {
                         .await?
                 }
                 "pixeldrain" => Pixeldrain::new(token.clone()).upload(&file).await?,
+                "tmpfiles" => TmpFiles::new().upload(&file).await?,
+                "temp.sh" => TempSh::new().upload(&file).await?,
+                "uguu" => Uguu::new().upload(&file).await?,
                 "vikingfile" => {
                     VikingFile::new(token.clone())
                         .upload(&file, folder.as_deref())
@@ -178,6 +191,15 @@ async fn run(cli: Cli) -> Result<()> {
                 "Uploaded to".bold(),
                 style::url(&url)
             );
+            if qr {
+                let qr_path = qr::generate(&url, &file)?;
+                println!(
+                    "{} {} {}",
+                    style::ok_prefix(),
+                    "QR saved to".bold(),
+                    style::dim(qr_path.display().to_string())
+                );
+            }
         }
     }
 
@@ -194,16 +216,18 @@ fn print_providers() {
         .set_header([
             "Provider",
             "Alias",
+            "Description",
             "Size limit",
             "Anon expiry",
             "Auth expiry",
             "Download",
         ]);
 
-    let rows: &[(&str, &str, &str, &str, &str, &str)] = &[
+    let rows: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
         (
             "catbox",
             "cb",
+            "Permanent simple hosting",
             "200 MB",
             "permanent",
             "permanent (with account)",
@@ -212,6 +236,7 @@ fn print_providers() {
         (
             "fuckingfast",
             "ff",
+            "Fast large-file sharing",
             "unlimited",
             "deleted if <30 downloads in 60 days",
             "same",
@@ -220,6 +245,7 @@ fn print_providers() {
         (
             "gofile",
             "gf",
+            "Folders and account storage",
             "unlimited",
             "10 days (resets on download)",
             "permanent (premium)",
@@ -228,6 +254,7 @@ fn print_providers() {
         (
             "litterbox",
             "lb",
+            "Short-lived Catbox uploads",
             "unlimited",
             "1h / 12h / 24h / 72h",
             "same",
@@ -236,6 +263,7 @@ fn print_providers() {
         (
             "pixeldrain",
             "pd",
+            "Large files with API access",
             "unlimited (API key required)",
             "60 days inactivity (resets on download)",
             "same",
@@ -244,6 +272,7 @@ fn print_providers() {
         (
             "vikingfile",
             "vf",
+            "Large temporary hosting",
             "unlimited",
             "15 days after last download",
             "never (premium)",
@@ -252,6 +281,7 @@ fn print_providers() {
         (
             "rootz",
             "rz",
+            "Folders and resumable uploads",
             "25 GB (anon) / unlimited (auth)",
             "15 days",
             "no expiry",
@@ -260,15 +290,43 @@ fn print_providers() {
         (
             "1fichier",
             "1f",
+            "Very large long-term files",
             "300 GB/file · 500 GB/upload",
             "no stated expiry",
             "permanent",
             "yes ** (Premium)",
         ),
+        (
+            "uguu",
+            "ug",
+            "Anonymous three-hour links",
+            "128 MiB",
+            "3 hours",
+            "n/a",
+            "yes",
+        ),
+        (
+            "tmpfiles",
+            "tf",
+            "Configurable short-lived links",
+            "100 MiB",
+            "1 hour default",
+            "n/a",
+            "share page",
+        ),
+        (
+            "temp.sh",
+            "ts",
+            "Large three-day transfers",
+            "4 GB",
+            "3 days",
+            "n/a",
+            "share page",
+        ),
     ];
 
-    for (name, alias, size, anon, auth, dl) in rows {
-        table.add_row([*name, *alias, *size, *anon, *auth, *dl]);
+    for (name, alias, description, size, anon, auth, dl) in rows {
+        table.add_row([*name, *alias, *description, *size, *anon, *auth, *dl]);
     }
 
     println!("{table}");
@@ -293,6 +351,9 @@ fn canonical_provider(name: &str) -> Result<&str> {
         "vf" => "vikingfile",
         "rz" => "rootz",
         "1f" => "1fichier",
+        "ug" => "uguu",
+        "tf" => "tmpfiles",
+        "ts" => "temp.sh",
         "catbox" => "catbox",
         "fuckingfast" => "fuckingfast",
         "gofile" => "gofile",
@@ -301,6 +362,9 @@ fn canonical_provider(name: &str) -> Result<&str> {
         "vikingfile" => "vikingfile",
         "rootz" => "rootz",
         "1fichier" => "1fichier",
+        "uguu" => "uguu",
+        "tmpfiles" | "tmpfiles.org" => "tmpfiles",
+        "temp" | "temp.sh" => "temp.sh",
         _ => anyhow::bail!(
             "Unknown provider '{}'. Run 'fsc providers' to see all options.",
             name
@@ -320,7 +384,7 @@ fn resolve_provider(provider: Option<String>, no_provider_prompt: bool) -> Resul
         .iter()
         .position(|provider| *provider == DEFAULT_PROVIDER)
         .unwrap_or(0);
-    let selected = Select::new()
+    let selected = FuzzySelect::new()
         .with_prompt("Select a provider")
         .items(PROVIDER_NAMES)
         .default(default)
@@ -396,7 +460,7 @@ fn infer_download_provider(url: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_PROVIDER, resolve_provider};
+    use super::{DEFAULT_PROVIDER, canonical_provider, resolve_provider};
 
     #[test]
     fn explicit_provider_skips_prompt() {
@@ -412,5 +476,12 @@ mod tests {
             resolve_provider(None, true).unwrap(),
             DEFAULT_PROVIDER.to_string()
         );
+    }
+
+    #[test]
+    fn resolves_new_provider_aliases() {
+        assert_eq!(canonical_provider("ug").unwrap(), "uguu");
+        assert_eq!(canonical_provider("tf").unwrap(), "tmpfiles");
+        assert_eq!(canonical_provider("ts").unwrap(), "temp.sh");
     }
 }
