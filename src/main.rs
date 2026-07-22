@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use dialoguer::Select;
 use owo_colors::OwoColorize;
 use std::{env, path::PathBuf};
 
@@ -15,6 +16,18 @@ use providers::{
     catbox::Catbox, fichier::OneFichier, fuckingfast::FuckingFast, gofile::Gofile,
     litterbox::Litterbox, pixeldrain::Pixeldrain, rootz::Rootz, vikingfile::VikingFile,
 };
+
+const DEFAULT_PROVIDER: &str = "gofile";
+const PROVIDER_NAMES: &[&str] = &[
+    "catbox",
+    "fuckingfast",
+    "gofile",
+    "litterbox",
+    "pixeldrain",
+    "vikingfile",
+    "rootz",
+    "1fichier",
+];
 
 #[derive(Parser)]
 #[command(
@@ -49,8 +62,12 @@ enum Commands {
         file: PathBuf,
 
         /// Provider: gofile (gf), fuckingfast (ff), pixeldrain (pd), vikingfile (vf), rootz (rz), 1fichier (1f), catbox (cb), litterbox (lb)
-        #[arg(short, long, default_value = "gofile")]
-        provider: String,
+        #[arg(short, long)]
+        provider: Option<String>,
+
+        /// Skip the provider picker and use gofile when --provider is omitted
+        #[arg(long)]
+        no_provider_prompt: bool,
 
         /// API token — gofile: API token · fuckingfast: account ID ·
         /// pixeldrain: API key · vikingfile: user hash · rootz: API key ·
@@ -103,6 +120,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Upload {
             file,
             provider,
+            no_provider_prompt,
             token,
             note,
             folder,
@@ -114,6 +132,7 @@ async fn run(cli: Cli) -> Result<()> {
                 anyhow::bail!("Not a regular file: {}", file.display());
             }
 
+            let provider = resolve_provider(provider, no_provider_prompt)?;
             let provider_name = canonical_provider(&provider)?;
             let token = resolve_upload_token(provider_name, token);
 
@@ -289,6 +308,27 @@ fn canonical_provider(name: &str) -> Result<&str> {
     })
 }
 
+fn resolve_provider(provider: Option<String>, no_provider_prompt: bool) -> Result<String> {
+    if let Some(provider) = provider {
+        return Ok(provider);
+    }
+    if no_provider_prompt {
+        return Ok(DEFAULT_PROVIDER.to_string());
+    }
+
+    let default = PROVIDER_NAMES
+        .iter()
+        .position(|provider| *provider == DEFAULT_PROVIDER)
+        .unwrap_or(0);
+    let selected = Select::new()
+        .with_prompt("Select a provider")
+        .items(PROVIDER_NAMES)
+        .default(default)
+        .interact()?;
+
+    Ok(PROVIDER_NAMES[selected].to_string())
+}
+
 fn resolve_upload_token(provider: &str, cli_token: Option<String>) -> Option<String> {
     token::normalize(cli_token).or_else(|| {
         let keys: &[&str] = match provider {
@@ -352,4 +392,25 @@ fn infer_download_provider(url: &str) -> Option<&'static str> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_PROVIDER, resolve_provider};
+
+    #[test]
+    fn explicit_provider_skips_prompt() {
+        assert_eq!(
+            resolve_provider(Some("ff".to_string()), false).unwrap(),
+            "ff"
+        );
+    }
+
+    #[test]
+    fn suppressed_prompt_uses_default_provider() {
+        assert_eq!(
+            resolve_provider(None, true).unwrap(),
+            DEFAULT_PROVIDER.to_string()
+        );
+    }
 }
